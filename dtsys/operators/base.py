@@ -19,6 +19,16 @@ class OperatorContext:
     work_bytes: int
     resolve_source: Callable[[str], str]
     is_cancelled: Callable[[], bool]
+    chunk_bytes: int | None = None
+    metrics: dict | None = None
+    slow_write_bytes: float = 0.0
+
+    def note_peak(self, name: str, value: int) -> None:
+        """记录某类在途/工作集占用的峰值（字节）。"""
+        if self.metrics is None:
+            return
+        key = f"peak_{name}_bytes"
+        self.metrics[key] = max(int(self.metrics.get(key, 0)), int(value))
 
 
 class Operator:

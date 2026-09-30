@@ -6,7 +6,7 @@
 ## 运行验证
 
 ```bash
-python -m pytest tests/ -q      # 5 个测试
+python -m pytest tests/ -q      # 10 个测试（含倾斜热键/混合空值/背压取消）
 python demo/run_demo.py         # 小数据直接计算对照 + 强制小内存重跑
 ```
 
@@ -62,12 +62,28 @@ store/
   `run(input_files, columns) -> (output_files, columns)`，自行决定落盘策略；
 - 用 `@register_operator("名字")` 注册，并在 `dtsys/operators/__init__.py` 导入。
 
-## 分块连接
+## 分块连接（倾斜安全）
 
-`join` 为递归分区哈希连接（`dtsys/operators/join.py`）：
+`join` 为递归分区哈希连接 + 倾斜兜底（`dtsys/operators/join.py`）：
 - 两侧按连接键哈希分成 16 个桶落盘，逐桶处理，内存中只保留一个桶；
 - 桶仍超预算时按哈希下一位递归；
-- 多对多语义：左行 × 右行的每个重复匹配都输出，不去重；支持 `inner` / `left`。
+- 若子分区几乎没有变小（热键/完全相同键，继续细分同一个键无意义）或哈希位
+  用尽，转为**分块嵌套循环**：构建侧每次只持有一个预算内的块，探测侧逐行
+  流式扫描，匹配结果**逐行**写出，绝不一次性生成整张乘积表；
+- 多对多语义：左行 × 右行的每个重复匹配都输出，乘积数量一行不少，不去重；
+- 空值混合（`None` / 键缺失 / 空串）按取值匹配：`None` 与缺失等价，
+  空串是独立键；支持 `inner` / `left`。
+
+## 在途数据与背压
+
+所有阻塞结果（连接输出、流式分块落盘、最终汇总）都经过有界结果通道
+`dtsys/flow.py` 的 `BoundedResultSink`：
+- 按行的 JSON 字节记账，在途数据达到 `memory_bytes` 时生产者阻塞，
+  由独立写出线程排空——下游读取/落盘很慢时同样受控，不丢输出；
+- 单条超大结果允许独占通道以保证可推进；
+- `RunConfig(slow_write_bytes=N)` 可模拟 N 字节/秒的慢速下游用于验证；
+- 运行实例 `instance.json` 的 `metrics` 记录 `peak_inflight_bytes`
+  （累计在途峰值）、`total_output_bytes`、`peak_join_work_bytes`（连接构建块峰值）。
 
 ## 取消
 

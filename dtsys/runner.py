@@ -19,6 +19,7 @@ import time
 from dataclasses import dataclass
 
 from .batches import Batch, jsonl_batches, merge_columns, write_jsonl, read_jsonl
+from .flow import BoundedResultSink
 from .operators import registry
 from .operators.base import OperatorContext
 from .plan import TransformPlan
@@ -37,6 +38,7 @@ class RunConfig:
     run_id: str
     memory_bytes: int = 64 * 1024 * 1024
     chunk_bytes: int | None = None  # 单批目标大小，缺省取内存预算的 1/4
+    slow_write_bytes: float = 0.0   # 模拟慢速下游（字节/秒），0 表示不限速
 
 
 class CancellationToken:
@@ -128,12 +130,18 @@ class Runner:
             "output": None,
             "row_count": 0,
             "error": None,
+            "metrics": {
+                "peak_inflight_bytes": 0,   # 累计在途结果的峰值（背压口径）
+                "total_output_bytes": 0,    # 流经有界通道的结果总字节
+                "peak_join_work_bytes": 0,  # 连接构建块/工作集峰值
+            },
         }
         self._save_instance(instance_path, instance)
 
         try:
             result_file, row_count, columns = self._run_pipeline(
                 plan, temp_dir, config.memory_bytes, chunk_bytes, token,
+                instance["metrics"], config.slow_write_bytes,
             )
             os.makedirs(staging_dir, exist_ok=True)
             final_output = os.path.join(staging_dir, "result.jsonl")
@@ -203,7 +211,8 @@ class Runner:
             self.run_dir(plan_id, ref["run_id"]), "output", "result.jsonl"
         )
 
-    def _run_pipeline(self, plan, temp_dir, memory_bytes, chunk_bytes, token):
+    def _run_pipeline(self, plan, temp_dir, memory_bytes, chunk_bytes, token,
+                      metrics, slow_write_bytes):
         def resolve_source(name: str) -> str:
             if name not in plan.sources:
                 raise KeyError(f"计划缺少数据源: {name}")
@@ -215,6 +224,9 @@ class Runner:
             work_bytes=memory_bytes,
             resolve_source=resolve_source,
             is_cancelled=lambda: token.cancelled,
+            chunk_bytes=chunk_bytes,
+            metrics=metrics,
+            slow_write_bytes=slow_write_bytes,
         )
 
         current_files: list[str] = [plan.sources[plan.primary_source]]
@@ -240,7 +252,19 @@ class Runner:
                             new_columns = result.columns
                         part += 1
                         out_path = os.path.join(stage_dir, f"part-{part:05d}.jsonl")
-                        write_jsonl(out_path, result.rows, result.columns)
+                        sink = BoundedResultSink(
+                            out_path, budget_bytes=memory_bytes,
+                            is_cancelled=lambda: token.cancelled,
+                            metrics=metrics,
+                            slow_write_bytes=slow_write_bytes,
+                        )
+                        try:
+                            for row in result.rows:
+                                sink.push(row)
+                            sink.close()
+                        except BaseException:
+                            sink.abort()
+                            raise
                         out_files.append(out_path)
                 columns = new_columns or columns
                 current_files = out_files
@@ -250,17 +274,22 @@ class Runner:
         final_dir = os.path.join(temp_dir, "final")
         os.makedirs(final_dir, exist_ok=True)
         final_path = os.path.join(final_dir, "result.jsonl")
-        row_count = 0
-        with open(final_path + ".tmp", "w", encoding="utf-8") as out_fh:
+        sink = BoundedResultSink(
+            final_path, budget_bytes=memory_bytes,
+            is_cancelled=lambda: token.cancelled, metrics=metrics,
+            slow_write_bytes=slow_write_bytes,
+        )
+        try:
             for path in current_files:
                 with open(path, "r", encoding="utf-8") as fh:
                     for line in fh:
                         if line.strip():
-                            if not line.endswith("\n"):
-                                line += "\n"
-                            out_fh.write(line)
-                            row_count += 1
-        os.replace(final_path + ".tmp", final_path)
+                            sink.push(json.loads(line))
+            sink.close()
+        except BaseException:
+            sink.abort()
+            raise
+        row_count = sink.row_count
         return final_path, row_count, columns
 
     @staticmethod
