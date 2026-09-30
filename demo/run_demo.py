@@ -1,4 +1,4 @@
-"""端到端演示：筛选 -> 字段推导 -> 两份数据连接。
+"""端到端演示：筛选 -> 字段推导 -> 两份数据连接 -> 分组聚合。
 
 1) 小数据直接计算出期望结果（reference）；
 2) 正常内存预算执行同一计划；
@@ -59,7 +59,17 @@ def reference_result():
                 matched = True
         if not matched:
             continue
-    return rows
+    grouped = {}
+    for row in rows:
+        key = row["level"]
+        state = grouped.setdefault(key, {"orders": 0, "amount": 0.0})
+        state["orders"] += 1
+        state["amount"] += row["taxed"]
+    return [
+        {"level": level, "orders": state["orders"],
+         "amount": round(state["amount"], 2)}
+        for level, state in sorted(grouped.items())
+    ]
 
 
 def read_jsonl(path):
@@ -86,6 +96,13 @@ def build_plan(orders_path, customers_path):
                 "left_on": "cust_id",
                 "right_on": "cust_id",
                 "how": "inner",
+            }),
+            OperatorSpec("aggregate", {
+                "group_by": ["level"],
+                "aggregations": {
+                    "orders": "count(*)",
+                    "amount": "sum(taxed)",
+                },
             }),
         ],
     )

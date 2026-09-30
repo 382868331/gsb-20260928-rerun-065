@@ -3,8 +3,8 @@
 模块划分：
 - plan:    转换计划（与运行实例分开保存）
 - batches: 统一的批次与落盘约定
-- operators: 算子基类、注册表与内置算子（筛选 / 字段推导 / 连接）
-- runner:  执行器，负责运行实例、内存预算、取消与原子发布
+- operators: 算子基类、注册表与内置算子（筛选 / 字段推导 / 连接 / 聚合）
+- runner:  执行器，负责运行实例、内存预算、背压、取消/恢复与原子发布
 """
 
 from .plan import TransformPlan, OperatorSpec, PlanStore

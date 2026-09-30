@@ -5,6 +5,7 @@ from .base import Operator, OperatorContext
 from .filter import FilterOperator
 from .derive import DeriveOperator
 from .join import JoinOperator
+from .aggregate import AggregateOperator
 
 __all__ = [
     "registry",
@@ -14,4 +15,5 @@ __all__ = [
     "FilterOperator",
     "DeriveOperator",
     "JoinOperator",
+    "AggregateOperator",
 ]

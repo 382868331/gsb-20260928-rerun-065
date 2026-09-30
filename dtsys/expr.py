@@ -28,12 +28,12 @@ _ALLOWED_FUNCS = {
 }
 
 _BIN_OPS = {
-    ast.Add: lambda a, b: a + b,
-    ast.Sub: lambda a, b: a - b,
-    ast.Mult: lambda a, b: a * b,
-    ast.Div: lambda a, b: a / b,
-    ast.FloorDiv: lambda a, b: a // b,
-    ast.Mod: lambda a, b: a % b,
+    ast.Add: lambda a, b: None if a is None or b is None else a + b,
+    ast.Sub: lambda a, b: None if a is None or b is None else a - b,
+    ast.Mult: lambda a, b: None if a is None or b is None else a * b,
+    ast.Div: lambda a, b: None if a is None or b is None else a / b,
+    ast.FloorDiv: lambda a, b: None if a is None or b is None else a // b,
+    ast.Mod: lambda a, b: None if a is None or b is None else a % b,
 }
 
 _CMP_OPS = {

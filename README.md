@@ -1,12 +1,12 @@
 # 数据转换执行系统（dtsys）
 
-纯 Python 标准库实现的数据转换执行系统。核心流程：**筛选 → 字段推导 → 两份数据连接**，
+纯 Python 标准库实现的数据转换执行系统。核心流程：**筛选 → 字段推导 → 两份数据连接 → 分组聚合**，
 转换计划与运行实例分开持久化；后续新增算子沿用同一套批次与结果约定。
 
 ## 运行验证
 
 ```bash
-python -m pytest tests/ -q      # 5 个测试
+python -m pytest tests/ -q      # 9 个测试
 python demo/run_demo.py         # 小数据直接计算对照 + 强制小内存重跑
 ```
 
@@ -22,7 +22,8 @@ python demo/run_demo.py         # 小数据直接计算对照 + 强制小内存�
 store/
   plans/<plan_id>/v<n>.json        计划版本，保存后不可变
   plans/<plan_id>/current.json     当前版本指针
-  runs/<plan_id>/<run_id>/instance.json   运行实例（状态/预算/行数/错误）
+  runs/<plan_id>/<run_id>/instance.json   运行实例（状态/预算/行数/错误/保存点）
+  runs/<plan_id>/<run_id>/checkpoints/    取消后保留的已完成阶段，恢复后删除
   runs/<plan_id>/<run_id>/output/         成功发布的结果（result.jsonl + manifest.json）
   runs/<plan_id>/<run_id>/tmp/            本次临时分块，成功/失败/取消均清理
   published/<plan_id>/v<n>.json           已发布版本 -> run_id 指针，不覆盖
@@ -30,7 +31,8 @@ store/
 
 关键保证：
 - 结果先写入 `output.staging/`，完整后原子 `os.replace` 为 `output/`；
-- 取消或失败只清理本次运行的 `tmp/` 与 staging，已发布版本与其他运行不受影响；
+- 每个阶段完整后才写 `checkpoints/stage-nnn/manifest.json`，未提交的下一阶段目录恢复时丢弃；
+- 取消或失败清理本次运行的 `tmp/` 与 staging，但保留已提交 checkpoints；成功后删除 checkpoints；
 - 同一计划版本重复运行不会覆盖首次发布指针。
 
 ## 计划格式
@@ -44,7 +46,9 @@ store/
   "stages": [
     {"op": "filter", "expr": "amount >= 100"},
     {"op": "derive", "fields": {"taxed": "round(amount * 1.1, 2)"}},
-    {"op": "join", "right_source": "customers", "left_on": "cust_id", "how": "inner"}
+    {"op": "join", "right_source": "customers", "left_on": "cust_id", "how": "inner"},
+    {"op": "aggregate", "group_by": ["level"],
+     "aggregations": {"orders": "count(*)", "amount": "sum(taxed)"}}
   ]
 }
 ```
@@ -74,7 +78,27 @@ store/
 - 多对多语义：左行 × 右行的每个重复匹配都输出，不去重；支持 `inner` / `left`；
 - 运行实例记录 `peak_inflight_bytes`（累计在途数据峰值，行 JSON 字节口径）。
 
+## 聚合与缓冲预算
+
+`aggregate` 支持 `count(*)`、`count(expr)`、`sum(expr)`、`min(expr)`、`max(expr)`、
+`avg(expr)`。分组键与聚合状态超预算时按键递归 16 路分区；每个分区独立聚合，
+不去重也不折叠同键重复行。表达式中的空值按 SQL 风格传播为空，`count(expr)`
+只统计非空表达式结果。
+
+预算口径是**驻留行/状态的 JSON 字节**，不是磁盘空间，也不计算 Python 对象头和 OS
+文件缓冲：
+- 流式阶段逐行处理，最多保留一个输入行与一个不超过 `chunk_bytes` 的输出批；
+- 阻塞连接最多驻留左右一对预算块，输出行立即写盘，不物化倾斜键乘积；
+- 阻塞聚合只驻留当前分区的分组状态，超过预算先分区再读取；
+- 单行或单键状态本身超过预算时属于不可再切分例外，实例中的
+  `peak_inflight_bytes` 会如实记录实际驻留值。
+
+阶段之间以提交后的分块文件作为持久、有界队列：下游慢时上游只推进到当前阶段保存点，
+不会把未来阶段的数据堆进内存；恢复从最近的阶段保存点继续，未提交阶段整体重跑。
+
 ## 取消
 
-`CancellationToken().cancel()` 可在任意批次边界与每个连接分区处被检测到，
-运行实例标记为 `cancelled`，临时结果清理后向上抛出。
+`CancellationToken().cancel()` 可在逐行边界、连接分区与聚合分区处被检测到。
+运行实例标记为 `cancelled`，只保留已提交阶段；用
+`RunConfig(..., resume=True)` 和同一 `run_id` 恢复。正式输出只在最终结果和清单完整后
+原子发布，因此恢复不会重复发布，`tmp/` 与未提交 checkpoint 也不会成为正式结果。

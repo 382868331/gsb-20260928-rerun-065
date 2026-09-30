@@ -6,6 +6,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -134,6 +135,159 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(json.load(fh)["run_id"], "r1")
         with self.assertRaises(FileExistsError):
             self.runner.save_plan(plan)
+
+    def _join_aggregate_plan(self, plan_id="ja"):
+        tmp = tempfile.mkdtemp()
+        left_path = os.path.join(tmp, "left.jsonl")
+        right_path = os.path.join(tmp, "right.jsonl")
+        left_rows = []
+        for i in range(48):
+            left_rows.append({
+                "id": i,
+                "k": None if i % 6 == 0 else ("HOT" if i % 3 == 0 else f"k{i % 4}"),
+                "v": i,
+            })
+        right_rows = [
+            {"k": "HOT", "factor": 2},
+            {"k": "HOT", "factor": 3},
+            {"k": "k0", "factor": 5},
+            {"k": None, "factor": 7},
+            {"k": None, "factor": 11},
+        ]
+        write_jsonl(left_path, left_rows)
+        write_jsonl(right_path, right_rows)
+        plan = TransformPlan(
+            plan_id=plan_id, name="join aggregate", version=1,
+            primary_source="left",
+            sources={"left": left_path, "right": right_path},
+            stages=[
+                OperatorSpec("filter", {"expr": "v >= 3"}),
+                OperatorSpec("join", {"right_source": "right",
+                                      "left_on": "k", "right_on": "k",
+                                      "how": "left"}),
+                OperatorSpec("aggregate", {"group_by": ["k"], "aggregations": {
+                    "n": "count(*)",
+                    "total_weighted": "sum(v * factor)",
+                    "max_factor": "max(factor)",
+                    "avg_v": "avg(v)",
+                }}),
+            ],
+        )
+        return plan, left_rows, right_rows
+
+    @staticmethod
+    def _reference_join_aggregate(left_rows, right_rows):
+        joined = []
+        for left in left_rows:
+            if left["v"] < 3:
+                continue
+            matches = [r for r in right_rows
+                       if repr(r.get("k")) == repr(left.get("k"))]
+            if matches:
+                for right in matches:
+                    row = dict(left)
+                    row["factor"] = right["factor"]
+                    joined.append(row)
+            else:
+                row = dict(left)
+                row["factor"] = None
+                joined.append(row)
+        grouped = {}
+        for row in joined:
+            key = row.get("k")
+            state = grouped.setdefault(key, {
+                "n": 0, "total_weighted": None, "max_factor": None,
+                "vs": [],
+            })
+            state["n"] += 1
+            if row["factor"] is not None:
+                weighted = row["v"] * row["factor"]
+                state["total_weighted"] = (
+                    weighted if state["total_weighted"] is None
+                    else state["total_weighted"] + weighted
+                )
+                state["max_factor"] = (
+                    row["factor"] if state["max_factor"] is None
+                    else max(state["max_factor"], row["factor"])
+                )
+            state["vs"].append(row["v"])
+        result = []
+        for key, state in grouped.items():
+            result.append({
+                "k": key,
+                "n": state["n"],
+                "total_weighted": state["total_weighted"],
+                "max_factor": state["max_factor"],
+                "avg_v": sum(state["vs"]) / len(state["vs"]),
+            })
+        return result
+
+    @staticmethod
+    def _multiset(rows):
+        return sorted(json.dumps(row, sort_keys=True, ensure_ascii=False,
+                                 default=str) for row in rows)
+
+    def test_join_aggregate_nulls_and_speeds_share_multiset(self):
+        plan, left_rows, right_rows = self._join_aggregate_plan()
+        expected = self._reference_join_aggregate(left_rows, right_rows)
+
+        fast = self._execute(plan, "fast", memory_bytes=1 << 20)
+        time.sleep(0.02)
+        slow = self._execute(plan, "slow", memory_bytes=256, chunk_bytes=64)
+        time.sleep(0.02)
+        smaller = self._execute(plan, "smaller", memory_bytes=128,
+                                chunk_bytes=32)
+
+        fast_rows = read_jsonl(os.path.join(
+            self.runner.run_dir("ja", "fast"), "output", "result.jsonl"))
+        slow_rows = read_jsonl(os.path.join(
+            self.runner.run_dir("ja", "slow"), "output", "result.jsonl"))
+        smaller_rows = read_jsonl(os.path.join(
+            self.runner.run_dir("ja", "smaller"), "output", "result.jsonl"))
+
+        self.assertEqual(self._multiset(fast_rows), self._multiset(expected))
+        self.assertEqual(self._multiset(slow_rows), self._multiset(expected))
+        self.assertEqual(self._multiset(smaller_rows), self._multiset(expected))
+        self.assertLessEqual(slow["peak_inflight_bytes"], 256)
+        self.assertGreater(smaller["chunk_bytes"], 0)
+
+    def test_cancel_resume_uses_checkpoint_without_duplicate_output(self):
+        from dtsys.operators.aggregate import AggregateOperator
+        plan, left_rows, right_rows = self._join_aggregate_plan("resume-p")
+        expected = self._reference_join_aggregate(left_rows, right_rows)
+        original = AggregateOperator.run
+        token = CancellationToken()
+
+        def cancel_before_aggregate(self, *args, **kwargs):
+            token.cancel()
+            return original(self, *args, **kwargs)
+
+        AggregateOperator.run = cancel_before_aggregate
+        try:
+            with self.assertRaises(RuntimeError):
+                self.runner.execute(
+                    plan, RunConfig(run_id="r", memory_bytes=256,
+                                    chunk_bytes=64), token)
+        finally:
+            AggregateOperator.run = original
+
+        cancelled_dir = self.runner.run_dir("resume-p", "r")
+        self.assertFalse(os.path.exists(os.path.join(cancelled_dir, "output")))
+        self.assertTrue(os.path.exists(os.path.join(
+            cancelled_dir, "checkpoints", "stage-002", "manifest.json")))
+        cancelled = self.runner.get_instance("resume-p", "r")
+        self.assertEqual(cancelled["status"], "cancelled")
+        self.assertEqual(cancelled["checkpoint"]["completed_stages"], 2)
+
+        resumed = self.runner.execute(
+            plan, RunConfig(run_id="r", memory_bytes=256, chunk_bytes=64,
+                            resume=True))
+        rows = read_jsonl(os.path.join(cancelled_dir, "output", "result.jsonl"))
+        self.assertEqual(resumed["status"], "published")
+        self.assertEqual(resumed["row_count"], len(expected))
+        self.assertEqual(self._multiset(rows), self._multiset(expected))
+        self.assertFalse(os.path.exists(os.path.join(cancelled_dir, "checkpoints")))
+        self.assertLessEqual(resumed["peak_inflight_bytes"], 256)
 
     def _skew_plan(self, left_rows, right_rows, how="inner", plan_id="skew"):
         tmp = tempfile.mkdtemp()
