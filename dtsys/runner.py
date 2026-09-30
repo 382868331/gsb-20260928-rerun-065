@@ -128,11 +128,12 @@ class Runner:
             "output": None,
             "row_count": 0,
             "error": None,
+            "peak_inflight_bytes": 0,
         }
         self._save_instance(instance_path, instance)
 
         try:
-            result_file, row_count, columns = self._run_pipeline(
+            result_file, row_count, columns, stats = self._run_pipeline(
                 plan, temp_dir, config.memory_bytes, chunk_bytes, token,
             )
             os.makedirs(staging_dir, exist_ok=True)
@@ -157,6 +158,7 @@ class Runner:
                 finished_at=time.strftime("%Y-%m-%dT%H:%M:%S%z"),
                 output="output/result.jsonl",
                 row_count=row_count,
+                peak_inflight_bytes=stats.get("join_peak_inflight_bytes", 0),
             )
             self._save_instance(instance_path, instance)
             self._publish(plan, config.run_id)
@@ -204,6 +206,8 @@ class Runner:
         )
 
     def _run_pipeline(self, plan, temp_dir, memory_bytes, chunk_bytes, token):
+        stats: dict = {}
+
         def resolve_source(name: str) -> str:
             if name not in plan.sources:
                 raise KeyError(f"计划缺少数据源: {name}")
@@ -215,6 +219,7 @@ class Runner:
             work_bytes=memory_bytes,
             resolve_source=resolve_source,
             is_cancelled=lambda: token.cancelled,
+            stats=stats,
         )
 
         current_files: list[str] = [plan.sources[plan.primary_source]]
@@ -261,7 +266,7 @@ class Runner:
                             out_fh.write(line)
                             row_count += 1
         os.replace(final_path + ".tmp", final_path)
-        return final_path, row_count, columns
+        return final_path, row_count, columns, stats
 
     @staticmethod
     def _scan_columns(paths) -> list[str]:

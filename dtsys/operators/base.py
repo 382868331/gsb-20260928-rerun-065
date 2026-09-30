@@ -6,7 +6,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable
 
 from ..batches import Batch
@@ -19,6 +19,7 @@ class OperatorContext:
     work_bytes: int
     resolve_source: Callable[[str], str]
     is_cancelled: Callable[[], bool]
+    stats: dict = field(default_factory=dict)
 
 
 class Operator:
