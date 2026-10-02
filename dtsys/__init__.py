@@ -12,6 +12,7 @@ from .batches import Batch, jsonl_batches, row_size
 from .operators.base import Operator, OperatorContext
 from .operators.registry import registry, register_operator
 from .runner import Runner, RunConfig, RunStatus, CancellationToken
+from .streamwin import StreamEngine, WindowSpec
 
 __all__ = [
     "TransformPlan",
@@ -28,4 +29,6 @@ __all__ = [
     "RunConfig",
     "RunStatus",
     "CancellationToken",
+    "StreamEngine",
+    "WindowSpec",
 ]
