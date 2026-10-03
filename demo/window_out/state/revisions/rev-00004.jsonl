@@ -1,0 +1,2 @@
+{"window_start": "2026-01-01T00:01:00Z", "window_end": "2026-01-01T00:02:00Z", "cust_id": "c1", "total": 80, "n": 1, "status": "confirmed"}
+{"window_start": "2026-01-01T00:02:00Z", "window_end": "2026-01-01T00:03:00Z", "cust_id": "c2", "total": 20, "n": 1, "status": "confirmed"}

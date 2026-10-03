@@ -1,0 +1,4 @@
+{"op": "upsert", "id": "o1", "seq": 1, "event_time": "2026-01-01T00:00:10Z", "cust_id": "c1", "amount": 100}
+{"op": "upsert", "id": "o2", "seq": 2, "event_time": "2026-01-01T00:00:40Z", "cust_id": "c1", "amount": 50}
+{"op": "watermark", "ts": "2026-01-01T00:05:00Z"}
+{"op": "upsert", "id": "o1", "seq": 3, "event_time": "2026-01-01T00:00:10Z", "cust_id": "c1", "amount": 130}

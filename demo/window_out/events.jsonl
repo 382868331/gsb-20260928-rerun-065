@@ -1,0 +1,7 @@
+{"op": "upsert", "id": "e1", "seq": 1, "event_time": "2026-01-01T00:02:05Z", "cust_id": "c2", "amount": 20}
+{"op": "upsert", "id": "e2", "seq": 2, "event_time": "2026-01-01T00:00:10Z", "cust_id": "c1", "amount": 100}
+{"op": "upsert", "id": "e3", "seq": 3, "event_time": "2026-01-01T00:00:40Z", "cust_id": "c1", "amount": 50}
+{"op": "watermark", "ts": "2026-01-01T00:01:00Z"}
+{"op": "upsert", "id": "e2", "seq": 4, "event_time": "2026-01-01T00:01:10Z", "cust_id": "c1", "amount": 80}
+{"op": "retract", "id": "e3", "seq": 5}
+{"op": "watermark", "ts": "2026-01-01T00:03:00Z"}
