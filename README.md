@@ -6,7 +6,7 @@
 ## 运行验证
 
 ```bash
-python -m pytest tests/ -q      # 5 个测试
+python -m pytest tests/ -q      # 25 个测试
 python demo/run_demo.py         # 小数据直接计算对照 + 强制小内存重跑
 ```
 
@@ -80,29 +80,49 @@ store/
 运行实例标记为 `cancelled`，临时结果清理后向上抛出。
 ## 事件时间分组窗口（dtsys/windowing.py）
 
-在批式计划之外提供**增量窗口引擎** WindowEngine，消费变更流（changelog），
-支持乱序到达、撤回/更正、暂定/确认视图与不可变修订发布。
+在批式计划之外提供**多来源增量窗口引擎** WindowEngine，消费变更流（changelog），
+支持乱序到达、撤回/更正、暂定/确认视图、不可变修订发布，以及
+**多个独立来源各自的到达位置、事件时间水位线与暂时停发决定**。
 
 事件格式（JSONL 每行一条）：
 
-    {"op": "upsert",  "id": "e1", "seq": 1, "event_time": "...", ...业务字段}
-    {"op": "retract", "id": "e1", "seq": 2}
-    {"op": "watermark", "ts": "..."}
+    {"source": "orders", "op": "upsert",  "id": "e1", "seq": 1, "event_time": "...", ...业务字段}
+    {"source": "orders", "op": "retract", "id": "e1", "seq": 2}
+    {"source": "orders", "op": "watermark", "ts": "..."}
+    {"op": "exclude_source", "source": "payments", "reason": "对方暂停"}
+    {"op": "resume_source",  "source": "payments"}
 
 关键语义：
 - 窗口按 event_time 分组，乱序到达不影响最终结果；
-- 同一 id 的 upsert 覆盖旧值（更正），retract 撤回整条记录；
+- 身份键是 (source, id)：不同来源可以共用同一个 id，
+  upsert/retract/重放只作用于对应来源；seq 也只在来源内比较；
+- 同一 (source, id) 的 upsert 覆盖旧值（更正），retract 撤回整条记录；
 - seq 单调递增，已应用的 seq 重放直接跳过，不会重复计入；
-- 窗口结束 <= 水位线即确认；迟到事件改动已确认窗口时生成新的
+- 有效水位线是所有活跃来源水位线的最小值；没有数据到达不等于
+  来源结束——未报告过水位线的来源会一直阻塞确认；只有显式
+  exclude_source(name, reason) 才暂时把来源排除在水位线之外，
+  publish_preview 可先预览"若停发可发布哪些窗口"而不改状态；
+- resume_source(name) 恢复来源后水位线约束重新生效，迟到数据照常进入；
+- 窗口结束 <= 有效水位线即确认；迟到事件改动已发布窗口时生成新的
   revisions/rev-<n>.jsonl，旧修订文件永不改写；
-- tentative_view() / confirmed_view() 分别查看暂定与已确认窗口；
+- 每次修订同时写 revisions/rev-<n>.basis.json，记录发布依据
+  （触发事件、基准来源、当时各来源水位线与停发状态）；
+- window_holds() / tentative_view() 对每个暂定窗口给出 waiting_for：
+  正在等待哪个来源（无水位线/水位线未越过窗口/连接匹配未齐）；
+- confirmed_view() 查看已确认窗口；
 - 每条事件的影响（连接结果增删 join_added/join_removed、各窗口金额
-  差额 window_deltas）逐笔记入 impact.jsonl；
-- 状态全部持久化在 state_dir，run_events(path, limit=n) 处理受限或
-  暂停后，用同一目录重建引擎即可从已接收偏移续跑，确认窗口不丢失；
+  差额 window_deltas）逐笔记入 impact.jsonl，停发/恢复记入 decisions.jsonl；
+- spec 用 stream_sources 声明参与水位线的来源，用 fact_sources
+  声明哪些来源产生窗口事实（其余来源可作为流式 join 维表）；
+- join 右来源若没有静态文件，就被视为一路流资料：窗口必须同时满足
+  两侧来源进度与合法一对多匹配，较快一侧不能单独宣布完整；
+- 状态全部持久化在 state_dir，run_events(path, limit=n, source=...)
+  按来源记录已接受字节偏移；export_savepoint() 导出各来源接受位置、
+  水位线与停发决定，换进程用同一目录重建即可还原续跑；
 - diff_revisions(old, new) 逐窗口核对两个修订的新增/删除/金额差额。
 
 窗口可与 filter / derive / join 组合（spec.stages 与批式计划同构）；
 连接保留维表合法重复（一条事实可放大为多行），撤回时全部移除。
 
-    python demo/run_window_demo.py    # 乱序 + 跨窗口更正 + 暂停续跑演示
+    python demo/run_window_demo.py               # 单来源乱序/更正/暂停续跑
+    python demo/run_multi_source_window_demo.py  # 多来源停发恢复/连接/保存点

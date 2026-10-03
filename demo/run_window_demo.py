@@ -78,7 +78,7 @@ def main():
     show("已确认窗口", engine.confirmed_view())
 
     rev_dir = os.path.join(state, "revisions")
-    revs = sorted(os.listdir(rev_dir))
+    revs = sorted(n for n in os.listdir(rev_dir) if n.endswith(".jsonl"))
     print("== 修订文件 ==")
     for name in revs:
         print("  " + name)
@@ -104,4 +104,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
