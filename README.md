@@ -137,14 +137,23 @@ store/
 多来源研究运行中可以按来源调整**允许迟到时间**，并区分来源重启前后的
 数据代际：
 
+- `confirmation_policy: {"mode": "on_watermark"}`（默认）表示窗口结束时间
+  一到有效水位线就发布，之后在各来源允许迟到期限内仍接纳修订；设为
+  `after_lateness` 则等待水位线越过“窗口结束 + 本来源允许迟到期限”后
+  才首次确认；运行中可调用
+  `set_confirmation_policy(mode, scope="future")`，默认只影响未来窗口；
+- 每个窗口持久化首次采用的确认口径、各来源期限、首次确认水位线与实际
+  确认延迟；历史范围改口径必须显式传
+  `scope="revision", window_range=(start,end), confirm=True`，旧修订文件
+  保留，只追加研究后的新修订；
 - `set_lateness(source, seconds)` 设置某来源的允许迟到秒数；超过
   "来源水位线 - 允许迟到" 的事件被丢弃并完整记录（`source_status()`
   的 `dropped_late`），缺省不限制；
 - 策略调整有两种作用域：`scope="future"` 只影响尚未确认的窗口——
   已发布窗口沿用确认时快照的旧策略，新的宽松策略不会悄悄把旧窗口
-  当作从未关闭；`scope="revision", window_range=(start, end)` 对指定
-  历史范围建立**修订研究**：更新该范围内窗口的策略快照、重新评估此前
-  被丢弃的事件，确实改变的窗口发布新修订；
+  当作从未关闭；`scope="revision", window_range=(start, end), confirm=True`
+  对指定历史范围建立**修订研究**：更新该范围内窗口的策略快照、重新评估
+  此前被丢弃的事件，确实改变的窗口发布新修订；
 - 每次修订的依据（哪些来源的迟到事件、哪条规则变化导致）通过
   `revision_causes()` 查看；没有实际数据变化时不产生重复修订；
 - `restart_source(source)`（或 `{"op": "restart"}` 事件）让来源换代：
