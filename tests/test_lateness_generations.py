@@ -140,7 +140,7 @@ class TestLatenessPolicy(unittest.TestCase):
 
         # 对历史范围建立修订研究：放宽 W0 所在区间的策略
         impact = engine.set_lateness("orders", 3600, scope="revision",
-                                     window_range=(W0, W1))
+                                     window_range=(W0, W1), confirm=True)
         self.assertEqual(impact["reapplied"],
                          [{"id": "o2", "seq": 2, "generation": 0}])
         self.assertIsNotNone(impact["revision"])
@@ -159,7 +159,7 @@ class TestLatenessPolicy(unittest.TestCase):
         self.assertEqual(open(rev1, "rb").read(), rev1_bytes)
         # 没有实际数据变化时不制造重复修订
         again = engine.set_lateness("orders", 7200, scope="revision",
-                                    window_range=(W0, W1))
+                                    window_range=(W0, W1), confirm=True)
         self.assertEqual(again["reapplied"], [])
         self.assertIsNone(again["revision"])
         self.assertEqual(engine.revision, impact["revision"])
@@ -167,6 +167,127 @@ class TestLatenessPolicy(unittest.TestCase):
         engine = WindowEngine(spec, self.state_dir())
         self.assertEqual(engine.source_status()["orders"]["dropped_late"], 0)
         self.assertIn(impact["revision"], engine.revision_causes())
+
+
+class TestConfirmationPolicy(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def _run_policy(self, policy, name):
+        spec = make_spec()
+        spec["streams"] = ["events"]
+        spec["primary_source"] = "events"
+        spec["lateness"] = {"events": 60}
+        spec["confirmation_policy"] = policy
+        state_dir = os.path.join(self.tmp, name)
+        engine = WindowEngine(spec, state_dir)
+        engine.apply_event(ev("events", 1, "e1",
+                              "2026-01-01T00:00:10Z", "c1", 100))
+        engine.apply_event(wm("events", "2026-01-01T00:01:00Z"))
+        at_deadline = engine.confirmed_view()
+        engine.apply_event(wm("events", "2026-01-01T00:01:30Z"))
+        late = engine.apply_event(ev("events", 2, "e2",
+                                    "2026-01-01T00:00:40Z", "c1", 7))
+        return engine, state_dir, at_deadline, late
+
+    def test_same_event_stream_compares_on_watermark_and_after_lateness(self):
+        immediate, _, immediate_at, immediate_late = self._run_policy(
+            "on_watermark", "immediate")
+        delayed, delayed_state, delayed_at, delayed_late = self._run_policy(
+            "after_lateness", "delayed")
+
+        self.assertEqual(len(immediate_at), 1)
+        immediate_row = immediate_at[0]
+        self.assertEqual(immediate_row["confirmation_policy"], "on_watermark")
+        self.assertEqual(immediate_row["confirmed_watermark"], W1)
+        self.assertIsNone(immediate_row["confirmation_deadline"])
+        self.assertIsNotNone(immediate_late["revision"])
+        immediate_causes = immediate.revision_causes()[
+            immediate_late["revision"]]
+        self.assertEqual(immediate_causes[0]["type"], "late_event")
+        self.assertEqual(immediate.revision_causes()[1], [])
+
+        self.assertEqual(delayed_at, [])
+        delayed_tentative = view_map(delayed.tentative_view())[(W0, "c1")]
+        self.assertEqual(delayed_tentative["waiting_on"], ["events"])
+        self.assertEqual(delayed_tentative["confirmation_policy"],
+                         "after_lateness")
+
+        delayed.apply_event(wm("events", "2026-01-01T00:02:00Z"))
+        delayed_rows = view_map(delayed.confirmed_view())
+        self.assertIn((W0, "c1"), delayed_rows)
+        delayed_row = delayed_rows[(W0, "c1")]
+        self.assertEqual(delayed_row["confirmation_policy"], "after_lateness")
+        self.assertEqual(delayed_row["confirmed_watermark"],
+                         "2026-01-01T00:02:00Z")
+        self.assertEqual(delayed_row["confirmation_deadline"],
+                         "2026-01-01T00:02:00Z")
+        self.assertEqual(delayed_row["confirmation_deadlines"],
+                         {"events": "2026-01-01T00:02:00Z"})
+        self.assertIsNone(delayed_late["revision"])
+        self.assertEqual(delayed.revision_causes()[1], [])
+
+        immediate_final = view_map(immediate.confirmed_view())[(W0, "c1")]
+        delayed_final = view_map(delayed.confirmed_view())[(W0, "c1")]
+        self.assertEqual((immediate_final["total"], immediate_final["n"]),
+                         (delayed_final["total"], delayed_final["n"]))
+        self.assertEqual(immediate_final["total"], 107)
+        self.assertEqual(delayed_final["n"], 2)
+
+        reopened = WindowEngine(make_spec(), delayed_state)
+        reopened_row = view_map(reopened.confirmed_view())[(W0, "c1")]
+        self.assertEqual(reopened_row, delayed_final)
+        self.assertEqual(reopened.revision_causes(), delayed.revision_causes())
+
+    def test_future_policy_change_keeps_first_policy_for_open_window(self):
+        spec = make_spec()
+        spec["streams"] = ["events"]
+        spec["primary_source"] = "events"
+        spec["lateness"] = {"events": 60}
+        spec["confirmation_policy"] = "on_watermark"
+        engine = WindowEngine(spec, os.path.join(self.tmp, "future"))
+        engine.apply_event(ev("events", 1, "e1",
+                              "2026-01-01T00:00:10Z", "c1", 100))
+        engine.set_confirmation_policy("after_lateness")
+        engine.apply_event(wm("events", W1))
+        self.assertEqual(len(engine.confirmed_view()), 1)
+
+        engine.apply_event(ev("events", 2, "e2",
+                              "2026-01-01T00:01:10Z", "c1", 5))
+        engine.apply_event(wm("events", "2026-01-01T00:02:00Z"))
+        w1 = view_map(engine.tentative_view())[(W1, "c1")]
+        self.assertEqual(w1["waiting_on"], ["events"])
+        engine.apply_event(wm("events", "2026-01-01T00:03:00Z"))
+        self.assertEqual(view_map(engine.confirmed_view())[(W1, "c1")]
+                         ["confirmation_policy"], "after_lateness")
+
+    def test_historical_policy_restudy_requires_confirmation_and_keeps_release(self):
+        spec = make_spec()
+        spec["streams"] = ["events"]
+        spec["primary_source"] = "events"
+        spec["lateness"] = {"events": 60}
+        spec["confirmation_policy"] = "on_watermark"
+        state_dir = os.path.join(self.tmp, "history")
+        engine = WindowEngine(spec, state_dir)
+        engine.apply_event(ev("events", 1, "e1",
+                              "2026-01-01T00:00:10Z", "c1", 100))
+        engine.apply_event(wm("events", W1))
+        rev1 = os.path.join(state_dir, "revisions", "rev-00001.jsonl")
+        rev1_bytes = open(rev1, "rb").read()
+        with self.assertRaisesRegex(ValueError, "confirm=True"):
+            engine.set_confirmation_policy(
+                "after_lateness", scope="revision",
+                window_range=(W0, W1))
+        impact = engine.set_confirmation_policy(
+            "after_lateness", scope="revision",
+            window_range=(W0, W1), confirm=True)
+        self.assertTrue(impact["acknowledged"])
+        self.assertEqual(impact["preserved_published_windows"], [
+            {"window_start": W0,
+             "revision_policy_kept": "on_watermark"}])
+        self.assertEqual(view_map(engine.confirmed_view())[(W0, "c1")]
+                         ["confirmation_policy"], "on_watermark")
+        self.assertEqual(open(rev1, "rb").read(), rev1_bytes)
 
 
 class TestSourceGenerations(unittest.TestCase):

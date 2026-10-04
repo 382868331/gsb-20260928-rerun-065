@@ -66,9 +66,10 @@ def main():
           "lateness:", impact.get("lateness_seconds"))
 
     print("-- 对历史范围 [00:00, 00:01) 建立修订研究：放宽到 3600 秒 --")
-    impact = engine.set_lateness("orders", 3600, scope="revision",
-                                 window_range=("2026-01-01T00:00:00Z",
-                                               "2026-01-01T00:01:00Z"))
+    impact = engine.set_lateness(
+        "orders", 3600, scope="revision",
+        window_range=("2026-01-01T00:00:00Z",
+                      "2026-01-01T00:01:00Z"), confirm=True)
     print("  重新落窗:", impact["reapplied"], "修订:", impact["revision"])
     show("修订依据（哪些来源与规则变化导致）",
          engine.revision_causes()[impact["revision"]])

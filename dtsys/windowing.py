@@ -25,6 +25,12 @@
 - 每个来源可单独设置**允许迟到时间**（set_lateness）：超过来源水位线
   减去允许迟到时间的事件被丢弃并记录在案（dropped），不再改动窗口；
   缺省不限制（保持向后兼容）。策略调整分两种作用域：
+    * confirmation_policy="on_watermark"（默认）：窗口结束时间一到有效
+      水位即确认，后续迟到事件以修订形式接纳；
+    * confirmation_policy="after_lateness"：等待所有未停发来源的水位线
+      越过"窗口结束 + 各自允许迟到时间"后再确认；某来源未设有限期时
+      继续等待。每个窗口首次见到数据时固化口径与期限，运行中 future
+      改策略不改已有窗口；历史范围重研需显式传 confirm=True；
     * scope="future"：只影响尚未确认的窗口，已发布窗口沿用确认时
       快照的旧策略，不会被新的宽松策略悄悄当作从未关闭；
     * scope="revision" + window_range=(start, end)：对指定历史范围
@@ -67,7 +73,8 @@
     "group_by": ["cust_id"],
     "aggregates": {"total": "sum(amount)", "n": "count()"}
   },
-  "lateness": {"orders": 120}        # 各来源允许迟到秒数，缺省不限
+  "lateness": {"orders": 120},       # 各来源允许迟到秒数，缺省不限
+  "confirmation_policy": "on_watermark"  # 或 after_lateness
 }
 """
 
@@ -156,7 +163,12 @@ class WindowEngine:
         # 各来源允许迟到秒数：None 表示不限制（默认，兼容旧行为）
         self.lateness = {s: (spec.get("lateness") or {}).get(s)
                          for s in self.streams}
+        self.confirmation_policy = spec.get("confirmation_policy",
+                                            "on_watermark")
+        if self.confirmation_policy not in ("on_watermark", "after_lateness"):
+            raise ValueError("未知确认口径: %s" % self.confirmation_policy)
         self.window_policy = {}   # 窗口起点秒(str) -> {source: 确认时快照的策略}
+        self.window_confirmation = {}
         self.dropped = []         # 因超过允许迟到时间被丢弃的事件（供修订研究）
         self.rule_changes = []    # 迟到策略调整记录（修订研究的依据）
         self.rev_causes = {}      # 修订号(str) -> 导致该修订的来源与规则变化
@@ -314,14 +326,39 @@ class WindowEngine:
     def waiting_on(self, key):
         """仍在阻塞该窗口确认的来源列表（未停发且水位线未越过窗口结束）。"""
         end = key[0] + self.size
+        policy = self._confirmation_policy_for(key)
         pending = []
         for src in self.streams:
             if self.stalled.get(src):
                 continue
             mark = self.watermarks.get(src)
-            if mark is None or mark < end:
+            deadline = end
+            if policy == "after_lateness":
+                seconds = self._policy_lateness_for(key, src)
+                if seconds is None:
+                    pending.append(src)
+                    continue
+                deadline = end + seconds
+            if mark is None or mark < deadline:
                 pending.append(src)
         return sorted(pending)
+
+    def _confirmation_policy_for(self, key):
+        start = str(key[0])
+        snapshot = self.window_confirmation.get(start)
+        if snapshot is not None:
+            return snapshot["policy"]
+        return self.confirmation_policy
+
+    def _policy_lateness_for(self, key, source):
+        start = str(key[0])
+        snapshot = self.window_confirmation.get(start)
+        if snapshot is not None:
+            return snapshot.get("lateness_seconds", {}).get(source)
+        policy = self.window_policy.get(start)
+        if policy is not None and source in policy:
+            return policy[source]
+        return self.lateness.get(source)
 
     def _is_confirmed(self, key):
         # 确认是单调的：一旦发布就永远保持已确认（内容可被迟到事件
@@ -329,7 +366,45 @@ class WindowEngine:
         if json.dumps(key) in self.confirmed:
             return True
         mark = self.effective_watermark()
-        return mark is not None and key[0] + self.size <= mark
+        if mark is None:
+            return False
+        end = key[0] + self.size
+        if self._confirmation_policy_for(key) == "on_watermark":
+            return end <= mark
+        horizon = self._lateness_horizon(key)
+        return horizon is not None and end <= horizon
+
+    def _lateness_horizon(self, key):
+        """延迟确认口径下的有效水位：各来源水位扣除各自允许迟到。"""
+        horizons = []
+        for src in self.streams:
+            if self.stalled.get(src):
+                continue
+            mark = self.watermarks.get(src)
+            seconds = self._policy_lateness_for(key, src)
+            if mark is None or seconds is None:
+                return None
+            horizons.append(mark - seconds)
+        return min(horizons) if horizons else None
+
+    def _confirmation_snapshot(self, key):
+        end = key[0] + self.size
+        seconds = dict(self.lateness)
+        deadlines = {}
+        latest = None
+        if self.confirmation_policy == "after_lateness":
+            for src, value in seconds.items():
+                if self.stalled.get(src) or value is None:
+                    continue
+                deadline = end + value
+                deadlines[src] = fmt_ts(deadline)
+                latest = deadline if latest is None else max(latest, deadline)
+        return {
+            "policy": self.confirmation_policy,
+            "lateness_seconds": seconds,
+            "deadline": fmt_ts(latest) if latest is not None else None,
+            "deadlines": deadlines,
+        }
 
     def source_status(self):
         """各来源的接受位置、事件时间进度与停发决定（保存点内容的可读视图）。"""
@@ -342,6 +417,7 @@ class WindowEngine:
                 "stalled": self.stalled[src],
                 "generation": self.generations[src],
                 "lateness_seconds": self.lateness.get(src),
+                "confirmation_policy": self.confirmation_policy,
                 "dropped_late": sum(1 for d in self.dropped
                                   if d["source"] == src),
                 "live_records": sum(len(g)
@@ -395,10 +471,18 @@ class WindowEngine:
         因此新的宽松策略不会悄悄重开已经发布的旧窗口。
         """
         start = int(ts // self.size) * self.size
+        snapshot = self.window_confirmation.get(str(start))
+        if snapshot is not None:
+            return snapshot.get("lateness_seconds", {}).get(source)
         policy = self.window_policy.get(str(start))
         if policy is not None and source in policy:
             return policy[source]
         return self.lateness.get(source)
+
+    def _adopt_window_policy(self, start):
+        """窗口首次见到数据时固化当时口径与允许迟到期限。"""
+        self.window_confirmation.setdefault(
+            str(start), self._confirmation_snapshot((start, ())))
 
     def _too_late(self, source, ts):
         lateness = self._lateness_for(source, ts)
@@ -460,6 +544,7 @@ class WindowEngine:
                 self._append_impact(impact)
                 self._save_state()
                 return impact
+            self._adopt_window_policy(int(ts // self.size) * self.size)
 
         before = self._current_windows()
         records = self.live[source].setdefault(str(generation), {})
@@ -567,12 +652,14 @@ class WindowEngine:
         self._save_state()
         return impact
 
-    def set_lateness(self, source, seconds, scope="future", window_range=None):
+    def set_lateness(self, source, seconds, scope="future", window_range=None,
+                     confirm=False):
         """运行时调整某来源的允许迟到秒数（None 表示不限制）。
 
         scope="future"：只影响尚未确认的窗口；已发布窗口沿用确认时
         快照的旧策略，不会被新策略悄悄当作从未关闭。
-        scope="revision"：对 window_range=(start, end) 内的历史窗口
+        scope="revision"：必须显式 confirm=True，对 window_range=(start, end)
+        内的历史窗口
         建立修订研究——更新这些窗口的策略快照，重新评估此前因超时
         被丢弃的事件；确实改变的窗口发布新修订，修订依据（来源与
         规则变化）记入 revision_causes；没有实际数据变化则不产生
@@ -599,11 +686,16 @@ class WindowEngine:
         elif scope == "revision":
             if not window_range:
                 raise ValueError("scope='revision' 需要 window_range")
+            if not confirm:
+                raise ValueError("历史范围重研必须显式 confirm=True")
             start, end = (parse_ts(window_range[0]),
                           parse_ts(window_range[1]))
             for key in list(self.window_policy):
                 if start <= float(key) < end:
                     self.window_policy[key][source] = seconds
+                    snapshot = self.window_confirmation.get(key)
+                    if snapshot is not None:
+                        snapshot.setdefault("lateness_seconds", {})[source] = seconds
             self._pending_causes.append({
                 "type": "lateness_rule", "rule_change": change["id"],
                 "source": source, "lateness_seconds": seconds,
@@ -637,10 +729,58 @@ class WindowEngine:
         self._save_state()
         return impact
 
+    def set_confirmation_policy(self, policy, scope="future",
+                                window_range=None, confirm=False):
+        """设置确认口径：水位到达即发布，或等待允许迟到期限后再确认。"""
+        if policy not in ("on_watermark", "after_lateness"):
+            raise ValueError("未知确认口径: %s" % policy)
+        change = {
+            "id": len(self.rule_changes) + 1,
+            "type": "confirmation_policy",
+            "confirmation_policy": policy,
+            "scope": scope,
+            "window_range": (list(window_range)
+                             if window_range else None),
+            "effective_watermark": (
+                fmt_ts(self.effective_watermark())
+                if self.effective_watermark() is not None else None),
+        }
+        impact = {"op": "set_confirmation_policy",
+                  "rule_change": change["id"],
+                  "confirmation_policy": policy,
+                  "scope": scope, "revision": None}
+        if scope == "future":
+            self.confirmation_policy = policy
+            impact["applies_to"] = "unconfirmed_windows"
+        elif scope == "revision":
+            if not window_range:
+                raise ValueError("scope='revision' 需要 window_range")
+            if not confirm:
+                raise ValueError("历史范围重研必须显式 confirm=True")
+            start, end = parse_ts(window_range[0]), parse_ts(window_range[1])
+            preserved = []
+            for key_str, row in self.confirmed.items():
+                key = json.loads(key_str)
+                if start <= key[0] < end:
+                    preserved.append({
+                        "window_start": row["window_start"],
+                        "revision_policy_kept":
+                            self.window_confirmation[str(key[0])]["policy"],
+                    })
+            impact["preserved_published_windows"] = preserved
+            impact["acknowledged"] = True
+        else:
+            raise ValueError("未知作用域: %s" % scope)
+        self.rule_changes.append(change)
+        self._append_impact(impact)
+        self._save_state()
+        return impact
+
     def revision_causes(self):
         """各次修订的依据：哪些来源的哪些事件/规则变化导致了结果改变。"""
         return {int(rev): list(causes)
                 for rev, causes in self.rev_causes.items()}
+
     # ---- 视图 ----
 
     def tentative_view(self):
@@ -651,6 +791,7 @@ class WindowEngine:
             confirmed = self._is_confirmed(key)
             row["status"] = "confirmed" if confirmed else "tentative"
             row["waiting_on"] = [] if confirmed else self.waiting_on(key)
+            row["confirmation_policy"] = self._confirmation_policy_for(key)
             rows.append(row)
         return sorted(rows, key=lambda r: (r["window_start"],
                                            json.dumps(r, sort_keys=True)))
@@ -671,7 +812,27 @@ class WindowEngine:
             if self._is_confirmed(key):
                 row = dict(row)
                 row["status"] = "confirmed"
-                confirmed[json.dumps(key)] = row
+                key_str = json.dumps(key)
+                old_row = self.confirmed.get(key_str)
+                if old_row is not None:
+                    for meta in ("confirmed_at", "confirmation_policy",
+                                 "confirmed_watermark",
+                                 "confirmation_deadline",
+                                 "confirmation_deadlines"):
+                        if meta in old_row:
+                            row[meta] = old_row[meta]
+                else:
+                    start = key[0]
+                    snapshot = self.window_confirmation.get(
+                        str(start), self._confirmation_snapshot(key))
+                    row["confirmed_at"] = datetime.now(timezone.utc).strftime(
+                        "%Y-%m-%dT%H:%M:%SZ")
+                    row["confirmed_watermark"] = fmt_ts(
+                        self.effective_watermark())
+                    row["confirmation_policy"] = snapshot["policy"]
+                    row["confirmation_deadline"] = snapshot["deadline"]
+                    row["confirmation_deadlines"] = snapshot["deadlines"]
+                confirmed[key_str] = row
         if confirmed == self.confirmed:
             return None     # 没有实际数据变化：不制造重复修订
         # 新确认的窗口快照当前各来源迟到策略：之后的策略调整
@@ -681,6 +842,8 @@ class WindowEngine:
                 start = json.loads(key_str)[0]
                 self.window_policy.setdefault(str(start),
                                               dict(self.lateness))
+                self.window_confirmation.setdefault(
+                    str(start), self._confirmation_snapshot(json.loads(key_str)))
         self.confirmed = confirmed
         self.revision += 1
         path = os.path.join(self.revisions_dir,
@@ -732,7 +895,7 @@ class WindowEngine:
 
     def _save_state(self):
         data = {
-            "state_version": 2,
+            "state_version": 3,
             "live": self.live,
             "last_seq": self.last_seq,
             "watermarks": self.watermarks,
@@ -740,7 +903,9 @@ class WindowEngine:
             "offsets": self.offsets,
             "generations": self.generations,
             "lateness": self.lateness,
+            "confirmation_policy": self.confirmation_policy,
             "window_policy": self.window_policy,
+            "window_confirmation": self.window_confirmation,
             "dropped": self.dropped,
             "rule_changes": self.rule_changes,
             "rev_causes": self.rev_causes,
@@ -777,7 +942,18 @@ class WindowEngine:
         self.generations = {s: int(data.get("generations", {}).get(s, 0))
                             for s in self.streams}
         self.lateness.update(data.get("lateness", {}))
+        self.confirmation_policy = data.get("confirmation_policy",
+                                           "on_watermark")
         self.window_policy = dict(data.get("window_policy", {}))
+        self.window_confirmation = dict(data.get("window_confirmation", {}))
+        for key_str, row in data.get("confirmed", {}).items():
+            start = str(json.loads(key_str)[0])
+            self.window_confirmation.setdefault(start, {
+                "policy": row.get("confirmation_policy", "on_watermark"),
+                "lateness_seconds": dict(self.window_policy.get(start, {})),
+                "deadline": row.get("confirmation_deadline"),
+                "deadlines": row.get("confirmation_deadlines", {}),
+            })
         self.dropped = list(data.get("dropped", []))
         self.rule_changes = list(data.get("rule_changes", []))
         self.rev_causes = dict(data.get("rev_causes", {}))

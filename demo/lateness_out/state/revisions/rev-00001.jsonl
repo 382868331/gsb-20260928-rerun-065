@@ -1,1 +1,1 @@
-{"window_start": "2026-01-01T00:00:00Z", "window_end": "2026-01-01T00:01:00Z", "cust_id": "c1", "total": 100, "n": 1, "status": "confirmed"}
+{"window_start": "2026-01-01T00:00:00Z", "window_end": "2026-01-01T00:01:00Z", "cust_id": "c1", "total": 100, "n": 1, "status": "confirmed", "confirmed_at": "2026-10-04T22:09:23Z", "confirmed_watermark": "2026-01-01T00:05:00Z", "confirmation_policy": "on_watermark", "confirmation_deadline": null, "confirmation_deadlines": {}}

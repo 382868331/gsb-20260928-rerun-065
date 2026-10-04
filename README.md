@@ -140,11 +140,18 @@ store/
 - `set_lateness(source, seconds)` 设置某来源的允许迟到秒数；超过
   "来源水位线 - 允许迟到" 的事件被丢弃并完整记录（`source_status()`
   的 `dropped_late`），缺省不限制；
+- `confirmation_policy` 支持两种确认口径：`on_watermark`（默认，窗口结束
+  时间一到有效水位即发布，后续迟到事件通过修订接纳）和 `after_lateness`
+  （等到各来源水位越过 "窗口结束 + 允许迟到" 后再确认；未设置有限迟到
+  期限的来源仍保持等待）；运行中调用
+  `set_confirmation_policy(policy, scope="future")` 只影响此后首次采用口径
+  的窗口，已存在窗口保留首次口径与期限；
 - 策略调整有两种作用域：`scope="future"` 只影响尚未确认的窗口——
   已发布窗口沿用确认时快照的旧策略，新的宽松策略不会悄悄把旧窗口
   当作从未关闭；`scope="revision", window_range=(start, end)` 对指定
   历史范围建立**修订研究**：更新该范围内窗口的策略快照、重新评估此前
-  被丢弃的事件，确实改变的窗口发布新修订；
+  被丢弃的事件，确实改变的窗口发布新修订；历史重研必须显式传
+  `confirm=True`，旧修订文件保持不变；
 - 每次修订的依据（哪些来源的迟到事件、哪条规则变化导致）通过
   `revision_causes()` 查看；没有实际数据变化时不产生重复修订；
 - `restart_source(source)`（或 `{"op": "restart"}` 事件）让来源换代：
