@@ -41,6 +41,18 @@
   暂停/受限后可用同一目录继续，run_events 按来源从已接收偏移续跑，
   尚未完成的来源范围在 source_status() 中清楚保留。
 
+允许迟到策略与数据代际：
+- set_lateness(source, seconds) 运行中调整某来源的允许迟到时间，
+  默认只影响今后的窗口（从当前有效水位线起生效）；已发布的旧窗口
+  保持已确认，不会被新策略悄悄当作从未关闭；
+- set_lateness(..., restudy=(start, end)) 对指定历史范围建立修订研究，
+  只有结果实际变化才发布新修订，无变化不产生重复修订；
+- 每条修订附带 revision_meta/rev-<n>.json，列出导致变化的来源与
+  规则变化原因及受影响窗口；
+- restart_source(source) 进入新数据代际：seq 重新计数（按代际去重）、
+  水位线重置；旧代际迟到数据仍生成修订，但旧代际水位线不能推进
+  新实例；事件带更高 "generation" 时视为该来源已重启。
+
 窗口规格（spec）：
 {
   "streams": ["orders", "payments"],   # 流式输入来源，缺省 ["events"]
@@ -133,12 +145,19 @@ class WindowEngine:
 
         # 持久化状态（全部按来源分开）
         self.live = {s: {} for s in self.streams}      # src -> id -> 原始负载
-        self.last_seq = {s: {} for s in self.streams}  # src -> id -> 最大 seq
+        # src -> 代际 -> id -> 最大 seq（来源重启后 seq 重新计数，按代际去重）
+        self.last_seq = {s: {} for s in self.streams}
         self.watermarks = {s: None for s in self.streams}
         self.stalled = {s: False for s in self.streams}
         self.offsets = {s: 0 for s in self.streams}    # src -> 已消费字节偏移
+        self.generations = {s: 0 for s in self.streams}  # src -> 当前代际
+        # src -> [{"from": epoch, "to": epoch|None, "seconds": int}]
+        # 允许迟到策略按窗口起始时间生效，新策略默认只影响今后的窗口
+        self.lateness_rules = {s: [] for s in self.streams}
         self.revision = 0
-        self.confirmed = {}     # 序列化 win_key -> 最近发布的确认行
+        self.confirmed = {}        # 序列化 win_key -> 最近发布的确认行
+        self.confirmed_keys = set()  # 所有已确认过的窗口（状态单调，永不回退）
+        self._pending_causes = []  # 上次发布修订以来积累的变更原因
         self.impact_path = os.path.join(state_dir, "impact.jsonl")
         self._load_state()
 
@@ -281,21 +300,38 @@ class WindowEngine:
             marks.append(mark)
         return min(marks) if marks else None
 
+    def lateness_for(self, source, window_start):
+        """该来源对起始时间为 window_start 的窗口生效的允许迟到秒数。
+
+        取最后一条覆盖该窗口起始时间的规则；没有规则时为 0。
+        """
+        seconds = 0
+        for rule in self.lateness_rules.get(source, []):
+            if rule["from"] <= window_start and \
+                    (rule["to"] is None or window_start < rule["to"]):
+                seconds = rule["seconds"]
+        return seconds
+
     def waiting_on(self, key):
-        """仍在阻塞该窗口确认的来源列表（未停发且水位线未越过窗口结束）。"""
-        end = key[0] + self.size
+        """仍在阻塞该窗口确认的来源列表（未停发且水位线未越过
+        窗口结束 + 该窗口生效的允许迟到时间）。"""
+        start = key[0]
+        end = start + self.size
         pending = []
         for src in self.streams:
             if self.stalled.get(src):
                 continue
             mark = self.watermarks.get(src)
-            if mark is None or mark < end:
+            if mark is None or mark < end + self.lateness_for(src, start):
                 pending.append(src)
         return sorted(pending)
 
     def _is_confirmed(self, key):
-        mark = self.effective_watermark()
-        return mark is not None and key[0] + self.size <= mark
+        # 已确认过的窗口永远保持已确认：来源重启或新的迟到策略
+        # 不能把旧窗口当作从未关闭（其最新值仍随迟到数据修订）
+        if json.dumps(key) in self.confirmed_keys:
+            return True
+        return not self.waiting_on(key)
 
     def source_status(self):
         """各来源的接受位置、事件时间进度与停发决定（保存点内容的可读视图）。"""
@@ -306,10 +342,98 @@ class WindowEngine:
                 "offset": self.offsets[src],
                 "watermark": fmt_ts(mark) if mark is not None else None,
                 "stalled": self.stalled[src],
+                "generation": self.generations[src],
+                "lateness_rules": [
+                    {"from": fmt_ts(r["from"]),
+                     "to": fmt_ts(r["to"]) if r["to"] is not None else None,
+                     "seconds": r["seconds"]}
+                    for r in self.lateness_rules[src]
+                ],
                 "live_records": len(self.live[src]),
                 "role": "primary" if src == self.primary else "stream",
             }
         return status
+
+    # ---- 允许迟到策略（运行中可调）----
+
+    def set_lateness(self, source, seconds, effective_from=None, restudy=None):
+        """调整某来源的允许迟到时间（秒）。
+
+        默认只影响今后的窗口：规则从当前有效水位线起生效，已经发布
+        的旧窗口保持原样，不会被新策略悄悄当作从未关闭。
+        - effective_from：显式指定规则生效的窗口起始时间（含）；
+        - restudy=(start, end)：对指定历史范围建立修订研究，新规则
+          只作用于窗口起始时间落在 [start, end) 内的窗口；若因此改变
+          了确认结果，发布一条列明原因的新修订，旧修订文件永不改写。
+        没有实际数据变化时不产生重复修订（revision 为 None）。
+        """
+        if source not in self.streams:
+            raise ValueError("未知来源: %s" % source)
+        seconds = int(seconds)
+        if seconds < 0:
+            raise ValueError("允许迟到时间不能为负: %s" % seconds)
+        if restudy is not None:
+            start, end = parse_ts(restudy[0]), parse_ts(restudy[1])
+            rule = {"from": start, "to": end, "seconds": seconds}
+        else:
+            if effective_from is None:
+                mark = self.effective_watermark()
+                effective_from = mark if mark is not None else 0.0
+            rule = {"from": parse_ts(effective_from), "to": None,
+                    "seconds": seconds}
+        self.lateness_rules[source].append(rule)
+        cause = {"type": "lateness_change", "source": source,
+                 "seconds": seconds,
+                 "effective_from": fmt_ts(rule["from"]),
+                 "effective_to": (fmt_ts(rule["to"])
+                                  if rule["to"] is not None else None),
+                 "restudy": restudy is not None}
+        self._pending_causes.append(cause)
+        before = set(self.confirmed)
+        revision = self._publish_revision()
+        newly = sorted(
+            _window_label(json.loads(k), self.size, self.group_by)[
+                "window_start"]
+            for k in set(self.confirmed) - before)
+        impact = {"op": "set_lateness", "source": source,
+                  "seconds": seconds,
+                  "effective_from": cause["effective_from"],
+                  "effective_to": cause["effective_to"],
+                  "restudy": cause["restudy"],
+                  "newly_confirmed": newly,
+                  "revision": revision}
+        self._append_impact(impact)
+        self._save_state()
+        return impact
+
+    # ---- 来源重启（数据代际）----
+
+    def restart_source(self, source, generation=None):
+        """标记某来源已重启：进入新数据代际。
+
+        新代际的 seq 重新计数（与旧代际各自去重），水位线重置为未知
+        （新实例的进度要重新推进）；旧代际迟到的数据事件仍按迟到数据
+        应用并生成修订，但旧代际的水位线不会推进新实例的水位。
+        已发布的窗口保持已确认，不会因重启被当作从未关闭。
+        """
+        if source not in self.streams:
+            raise ValueError("未知来源: %s" % source)
+        new_gen = self.generations[source] + 1 \
+            if generation is None else int(generation)
+        if new_gen <= self.generations[source]:
+            raise ValueError("新代际必须大于当前代际 %d: %s"
+                             % (self.generations[source], new_gen))
+        self.generations[source] = new_gen
+        self.watermarks[source] = None
+        self.last_seq[source].setdefault(str(new_gen), {})
+        cause = {"type": "restart", "source": source, "generation": new_gen}
+        self._pending_causes.append(cause)
+        revision = self._publish_revision()
+        impact = {"op": "restart_source", "source": source,
+                  "generation": new_gen, "revision": revision}
+        self._append_impact(impact)
+        self._save_state()
+        return impact
 
     def set_stalled(self, source, stalled=True):
         """显式把某来源暂时视为不再推进（或恢复推进）。
@@ -321,6 +445,8 @@ class WindowEngine:
         if source not in self.streams:
             raise ValueError("未知来源: %s" % source)
         self.stalled[source] = bool(stalled)
+        self._pending_causes.append(
+            {"type": "stall" if stalled else "resume", "source": source})
         before = set(self.confirmed)
         revision = None
         windows = self._current_windows()
@@ -351,16 +477,24 @@ class WindowEngine:
         op = event.get("op", "upsert")
         if op == "watermark":
             return self.advance_watermark(event["ts"],
-                                          source=event.get("source"))
+                                          source=event.get("source"),
+                                          generation=event.get("generation"))
 
         source = event.get("source", self.primary)
         if source not in self.streams:
             raise ValueError("未知来源: %s" % source)
         rec_id = event["id"]
         seq = event.get("seq")
-        last = self.last_seq[source]
+        gen = event.get("generation")
+        if gen is not None and int(gen) > self.generations[source]:
+            # 事件显式带来更高代际：视为该来源已经重启
+            self.restart_source(source, int(gen))
+        gen = self.generations[source] if gen is None else int(gen)
+        stale_generation = gen < self.generations[source]
+        last = self.last_seq[source].setdefault(str(gen), {})
         if seq is not None and rec_id in last and seq <= last[rec_id]:
             return {"source": source, "id": rec_id, "op": op,
+                    "generation": gen,
                     "skipped": "replay", "revision": None,
                     "window_deltas": {}}
 
@@ -373,7 +507,7 @@ class WindowEngine:
             self.live[source].pop(rec_id, None)
         elif op == "upsert":
             payload = {k: v for k, v in event.items()
-                       if k not in ("op", "id", "seq", "source")}
+                       if k not in ("op", "id", "seq", "source", "generation")}
             self.live[source][rec_id] = payload
         else:
             raise ValueError("未知事件 op: %s" % op)
@@ -406,10 +540,16 @@ class WindowEngine:
 
         revision = None
         if touched_confirmed:
+            self._pending_causes.append(
+                {"type": "late_event" if stale_generation else "event",
+                 "source": source, "id": rec_id, "op": op, "seq": seq,
+                 "generation": gen})
             revision = self._publish_revision()
 
         impact = {
             "source": source, "id": rec_id, "op": op, "seq": seq,
+            "generation": gen,
+            "stale_generation": stale_generation,
             "join_removed": old_rows,   # 更正/撤回移除的连接结果
             "join_added": new_rows,     # 更正/新增产生的连接结果
             "window_deltas": deltas,    # 各窗口金额差额
@@ -419,17 +559,35 @@ class WindowEngine:
         self._save_state()
         return impact
 
-    def advance_watermark(self, ts, source=None):
+    def advance_watermark(self, ts, source=None, generation=None):
         source = source or self.primary
         if source not in self.streams:
             raise ValueError("未知来源: %s" % source)
+        if generation is not None and int(generation) > self.generations[source]:
+            self.restart_source(source, int(generation))
+        if generation is not None and int(generation) < self.generations[source]:
+            # 旧代际的水位线不能推进新实例的进度
+            impact = {"op": "watermark", "source": source,
+                      "generation": int(generation),
+                      "skipped": "stale_generation",
+                      "watermark": (
+                          fmt_ts(self.watermarks[source])
+                          if self.watermarks[source] is not None else None),
+                      "revision": None}
+            self._append_impact(impact)
+            self._save_state()
+            return impact
         mark = parse_ts(ts)
         if self.watermarks[source] is None or mark > self.watermarks[source]:
             self.watermarks[source] = mark
+        self._pending_causes.append(
+            {"type": "watermark", "source": source,
+             "generation": self.generations[source], "ts": fmt_ts(mark)})
         revision = self._publish_revision()
         self._save_state()
         effective = self.effective_watermark()
         return {"op": "watermark", "source": source,
+                "generation": self.generations[source],
                 "watermark": fmt_ts(self.watermarks[source]),
                 "effective_watermark": (fmt_ts(effective)
                                         if effective is not None else None),
@@ -459,13 +617,29 @@ class WindowEngine:
     # ---- 修订发布（旧文件永不改写）----
 
     def _publish_revision(self):
+        """发布当前确认集合为新修订；与上次发布完全一致时不重复发布。
+
+        确认状态单调：已确认过的窗口即使水位线重置也保持已确认，
+        其发布的永远是最新值（数据被撤光时按删除发布）。每条修订
+        附带 revision_meta/rev-<n>.json，列出导致本次变化的来源与
+        规则变化原因。
+        """
         windows = self._current_windows()
-        self.confirmed = {}
+        confirmed = {}
         for key, row in windows.items():
             if self._is_confirmed(key):
                 row = dict(row)
                 row["status"] = "confirmed"
-                self.confirmed[json.dumps(key)] = row
+                confirmed[json.dumps(key)] = row
+        self.confirmed_keys.update(confirmed)
+        if confirmed == self.confirmed:
+            return None
+        changed = []
+        for key, row in confirmed.items():
+            if self.confirmed.get(key) != row:
+                changed.append(_window_label(json.loads(key), self.size,
+                                             self.group_by))
+        self.confirmed = confirmed
         self.revision += 1
         path = os.path.join(self.revisions_dir,
                             "rev-%05d.jsonl" % self.revision)
@@ -475,7 +649,26 @@ class WindowEngine:
                 fh.write(json.dumps(row, ensure_ascii=False, default=str))
                 fh.write("\n")
         os.replace(tmp, path)
+        meta = {"revision": self.revision,
+                "causes": self._pending_causes,
+                "changed_windows": changed}
+        meta_dir = os.path.join(self.state_dir, "revision_meta")
+        os.makedirs(meta_dir, exist_ok=True)
+        meta_path = os.path.join(meta_dir, "rev-%05d.json" % self.revision)
+        with open(meta_path + ".tmp", "w", encoding="utf-8") as fh:
+            json.dump(meta, fh, ensure_ascii=False, default=str)
+        os.replace(meta_path + ".tmp", meta_path)
+        self._pending_causes = []
         return self.revision
+
+    def revision_meta(self, revision):
+        """读取某条修订的元信息（变更原因与受影响窗口）。"""
+        path = os.path.join(self.state_dir, "revision_meta",
+                            "rev-%05d.json" % revision)
+        if not os.path.exists(path):
+            return None
+        with open(path, "r", encoding="utf-8") as fh:
+            return json.load(fh)
 
     # ---- 输入文件续跑 ----
 
@@ -518,8 +711,12 @@ class WindowEngine:
             "watermarks": self.watermarks,
             "stalled": self.stalled,
             "offsets": self.offsets,
+            "generations": self.generations,
+            "lateness_rules": self.lateness_rules,
+            "pending_causes": self._pending_causes,
             "revision": self.revision,
             "confirmed": self.confirmed,
+            "confirmed_keys": sorted(self.confirmed_keys),
         }
         tmp = self._state_path() + ".tmp"
         with open(tmp, "w", encoding="utf-8") as fh:
@@ -533,15 +730,28 @@ class WindowEngine:
         with open(path, "r", encoding="utf-8") as fh:
             data = json.load(fh)
         self.live = {s: dict(data["live"].get(s, {})) for s in self.streams}
-        self.last_seq = {s: dict(data["last_seq"].get(s, {}))
-                         for s in self.streams}
+        self.last_seq = {}
+        for s in self.streams:
+            saved = data["last_seq"].get(s, {})
+            if saved and all(isinstance(v, int) for v in saved.values()):
+                saved = {"0": saved}   # 旧格式（无代际）迁移为第 0 代
+            self.last_seq[s] = {str(g): dict(ids) for g, ids in saved.items()}
         self.watermarks = {s: data["watermarks"].get(s) for s in self.streams}
         self.stalled = {s: bool(data["stalled"].get(s, False))
                         for s in self.streams}
         self.offsets = {s: int(data["offsets"].get(s, 0))
                         for s in self.streams}
+        self.generations = {s: int(data.get("generations", {}).get(s, 0))
+                            for s in self.streams}
+        self.lateness_rules = {
+            s: [dict(rule) for rule in
+                data.get("lateness_rules", {}).get(s, [])]
+            for s in self.streams}
+        self._pending_causes = list(data.get("pending_causes", []))
         self.revision = data["revision"]
         self.confirmed = data["confirmed"]
+        self.confirmed_keys = set(data.get("confirmed_keys",
+                                           self.confirmed.keys()))
 
     def _append_impact(self, impact):
         with open(self.impact_path, "a", encoding="utf-8") as fh:

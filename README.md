@@ -131,3 +131,25 @@ store/
   尚未完成的来源范围在 `source_status()` 中清楚保留。
 
     python demo/run_multisource_demo.py    # 停发后恢复 + 迟到更正修订演示
+
+## 允许迟到策略与来源重启代际
+
+运行中可调整各来源的允许迟到时间，并区分来源重启前后的数据代际：
+
+- `set_lateness(source, seconds)`：新策略默认只影响**今后的窗口**
+  （从当前有效水位线起生效），已经发布的旧窗口保持已确认，不会被
+  新策略悄悄当作从未关闭；`effective_from=...` 可显式指定生效起点；
+- `set_lateness(source, seconds, restudy=(start, end))`：对指定历史
+  范围建立修订研究，只重评窗口起始时间落在 [start, end) 内的窗口；
+  结果有实际变化才发布新修订，没有数据变化的窗口不制造重复修订；
+- 每条修订附带 `revision_meta/rev-<n>.json`，列出导致本次变化的
+  来源与规则变化（事件/水位线/停发/迟到策略调整/重启）及受影响窗口；
+- `restart_source(source)`：标记来源重启，进入新数据代际——新代际
+  seq 重新计数（与旧代际各自去重）、水位线重置为未知；旧代际迟到的
+  数据事件仍按迟到数据修订已发布窗口，但旧代际水位线不能推进新实例；
+  事件显式携带更高 `"generation"` 时视为该来源已重启；
+- 确认状态单调：已确认过的窗口即使来源重启、水位线重置也保持已确认，
+  其发布的永远是最新值；`source_status()` 展示各来源代际与生效中的
+  迟到规则，暂停/恢复/重启交错时进度可解释。
+
+    python -m pytest tests/test_lateness_generations.py -q

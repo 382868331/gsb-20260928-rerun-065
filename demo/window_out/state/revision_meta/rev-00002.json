@@ -1,0 +1,1 @@
+{"revision": 2, "causes": [{"type": "event", "source": "events", "id": "e2", "op": "upsert", "seq": 4, "generation": 0}], "changed_windows": [{"window_start": "2026-01-01T00:00:00Z", "window_end": "2026-01-01T00:01:00Z", "cust_id": "c1"}]}

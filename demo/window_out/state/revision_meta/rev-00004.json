@@ -1,0 +1,1 @@
+{"revision": 4, "causes": [{"type": "watermark", "source": "events", "generation": 0, "ts": "2026-01-01T00:03:00Z"}], "changed_windows": [{"window_start": "2026-01-01T00:02:00Z", "window_end": "2026-01-01T00:03:00Z", "cust_id": "c2"}, {"window_start": "2026-01-01T00:01:00Z", "window_end": "2026-01-01T00:02:00Z", "cust_id": "c1"}]}
