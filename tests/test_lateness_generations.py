@@ -289,6 +289,64 @@ class TestConfirmationPolicy(unittest.TestCase):
                          ["confirmation_policy"], "on_watermark")
         self.assertEqual(open(rev1, "rb").read(), rev1_bytes)
 
+    def test_historical_restudy_to_on_watermark_confirms_waiting_window(self):
+        spec = make_spec()
+        spec["streams"] = ["events"]
+        spec["primary_source"] = "events"
+        spec["lateness"] = {"events": 3600}
+        spec["confirmation_policy"] = "after_lateness"
+        state_dir = os.path.join(self.tmp, "restudy")
+        engine = WindowEngine(spec, state_dir)
+        engine.apply_event(ev("events", 1, "e1",
+                              "2026-01-01T00:00:10Z", "c1", 100))
+        engine.apply_event(ev("events", 2, "e2",
+                              "2026-01-01T00:01:10Z", "c1", 5))
+        engine.apply_event(wm("events", "2026-01-01T00:02:00Z"))
+        # 两个窗口都在等迟到期限，尚未确认
+        self.assertEqual(engine.confirmed_view(), [])
+        with self.assertRaisesRegex(ValueError, "confirm=True"):
+            engine.set_confirmation_policy(
+                "on_watermark", scope="revision", window_range=(W0, W1))
+        # 只对 [W0, W1) 范围重研：W0 窗口立即确认并产生独立修订
+        impact = engine.set_confirmation_policy(
+            "on_watermark", scope="revision",
+            window_range=(W0, W1), confirm=True)
+        self.assertEqual(impact["newly_confirmed"], [W0])
+        self.assertIsNotNone(impact["revision"])
+        rev_no = impact["revision"]
+        confirmed = view_map(engine.confirmed_view())
+        self.assertEqual(confirmed[(W0, "c1")]["confirmation_policy"],
+                         "on_watermark")
+        # 范围隔离：W1 窗口保留原口径，仍在等待迟到期限
+        w1 = view_map(engine.tentative_view())[(W1, "c1")]
+        self.assertEqual(w1["status"], "tentative")
+        self.assertEqual(w1["confirmation_policy"], "after_lateness")
+        self.assertEqual(w1["waiting_on"], ["events"])
+        # 无实际变化的重研不产生重复修订
+        again = engine.set_confirmation_policy(
+            "on_watermark", scope="revision",
+            window_range=(W0, W1), confirm=True)
+        self.assertIsNone(again["revision"])
+        self.assertEqual(engine.revision, rev_no)
+        # 修订依据可解释
+        causes = engine.revision_causes()[rev_no]
+        self.assertEqual(causes[0]["type"], "confirmation_policy_rule")
+        self.assertEqual(causes[0]["confirmation_policy"], "on_watermark")
+        # 保存重开后结果一致，已发布修订文件不被改写
+        rev_files_before = {
+            name: open(os.path.join(state_dir, "revisions", name), "rb").read()
+            for name in os.listdir(os.path.join(state_dir, "revisions"))}
+        reopened = WindowEngine(spec, state_dir)
+        self.assertEqual(reopened.confirmed_view(), engine.confirmed_view())
+        self.assertEqual(reopened.revision_causes(),
+                         engine.revision_causes())
+        w1_reopened = view_map(reopened.tentative_view())[(W1, "c1")]
+        self.assertEqual(w1_reopened["confirmation_policy"], "after_lateness")
+        for name, content in rev_files_before.items():
+            self.assertEqual(
+                open(os.path.join(state_dir, "revisions", name), "rb").read(),
+                content)
+
 
 class TestSourceGenerations(unittest.TestCase):
     def setUp(self):

@@ -387,12 +387,13 @@ class WindowEngine:
             horizons.append(mark - seconds)
         return min(horizons) if horizons else None
 
-    def _confirmation_snapshot(self, key):
+    def _confirmation_snapshot(self, key, policy=None, lateness=None):
+        policy = policy or self.confirmation_policy
         end = key[0] + self.size
-        seconds = dict(self.lateness)
+        seconds = dict(self.lateness if lateness is None else lateness)
         deadlines = {}
         latest = None
-        if self.confirmation_policy == "after_lateness":
+        if policy == "after_lateness":
             for src, value in seconds.items():
                 if self.stalled.get(src) or value is None:
                     continue
@@ -400,7 +401,7 @@ class WindowEngine:
                 deadlines[src] = fmt_ts(deadline)
                 latest = deadline if latest is None else max(latest, deadline)
         return {
-            "policy": self.confirmation_policy,
+            "policy": policy,
             "lateness_seconds": seconds,
             "deadline": fmt_ts(latest) if latest is not None else None,
             "deadlines": deadlines,
@@ -731,7 +732,16 @@ class WindowEngine:
 
     def set_confirmation_policy(self, policy, scope="future",
                                 window_range=None, confirm=False):
-        """设置确认口径：水位到达即发布，或等待允许迟到期限后再确认。"""
+        """设置确认口径：水位到达即发布，或等待允许迟到期限后再确认。
+
+        scope="future"：只影响此后首次采用口径的窗口，已存在窗口保留
+        首次口径与期限。
+        scope="revision"：必须显式 confirm=True，对 window_range=(start, end)
+        内尚未确认的历史窗口改用新口径快照并立即重新评估——因此达到
+        确认条件的窗口发布为独立新修订，依据记入 revision_causes；
+        已发布窗口保留确认时口径，范围外窗口不受影响，旧修订文件
+        永不改写；没有窗口因此变为可确认时不产生重复修订。
+        """
         if policy not in ("on_watermark", "after_lateness"):
             raise ValueError("未知确认口径: %s" % policy)
         change = {
@@ -769,6 +779,41 @@ class WindowEngine:
                     })
             impact["preserved_published_windows"] = preserved
             impact["acknowledged"] = True
+            # 范围内尚未确认的窗口：改用新口径快照并立即重新评估，
+            # 确实因此达到确认条件的窗口发布为独立新修订；范围外窗口
+            # 与已发布窗口的口径快照不受影响，旧修订文件不改写
+            restudied = []
+            for key in self._current_windows():
+                if not start <= key[0] < end:
+                    continue
+                if json.dumps(key) in self.confirmed:
+                    continue
+                snapshot = self.window_confirmation.get(str(key[0]))
+                if snapshot is not None and snapshot["policy"] == policy:
+                    continue
+                lateness = (snapshot or {}).get("lateness_seconds")
+                self.window_confirmation[str(key[0])] = (
+                    self._confirmation_snapshot(key, policy=policy,
+                                                lateness=lateness))
+                restudied.append(key)
+            newly = [key for key in restudied if self._is_confirmed(key)]
+            revision = None
+            if newly:
+                self._pending_causes.append({
+                    "type": "confirmation_policy_rule",
+                    "rule_change": change["id"],
+                    "confirmation_policy": policy,
+                    "window_range": [fmt_ts(start), fmt_ts(end)]})
+                revision = self._publish_revision()
+                if revision is None:
+                    self._pending_causes.pop()  # 无实际变化，不留悬空依据
+            impact["restudied_windows"] = sorted(
+                _window_label(key, self.size, self.group_by)["window_start"]
+                for key in restudied)
+            impact["newly_confirmed"] = sorted(
+                _window_label(key, self.size, self.group_by)["window_start"]
+                for key in newly)
+            impact["revision"] = revision
         else:
             raise ValueError("未知作用域: %s" % scope)
         self.rule_changes.append(change)
