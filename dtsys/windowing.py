@@ -406,6 +406,30 @@ class WindowEngine:
             "deadlines": deadlines,
         }
 
+    def _snapshot_with_policy(self, snapshot, start, policy):
+        """在既有窗口快照上替换确认口径并按窗口结束时间重算期限。
+
+        允许迟到秒数快照保持不变（口径与迟到期限是两件事）；
+        水位到达口径没有任何确认期限。
+        """
+        end = start + self.size
+        seconds = dict(snapshot.get("lateness_seconds") or {})
+        deadlines = {}
+        latest = None
+        if policy == "after_lateness":
+            for src, value in seconds.items():
+                if value is None or self.stalled.get(src):
+                    continue
+                deadline = end + value
+                deadlines[src] = fmt_ts(deadline)
+                latest = deadline if latest is None else max(latest, deadline)
+        return {
+            "policy": policy,
+            "lateness_seconds": seconds,
+            "deadline": fmt_ts(latest) if latest is not None else None,
+            "deadlines": deadlines,
+        }
+
     def source_status(self):
         """各来源的接受位置、事件时间进度与停发决定（保存点内容的可读视图）。"""
         status = {}
@@ -767,6 +791,47 @@ class WindowEngine:
                         "revision_policy_kept":
                             self.window_confirmation[str(key[0])]["policy"],
                     })
+            # 显式历史重研确认后必须真正生效：对范围内**尚未确认**的
+            # 窗口更新其口径快照，然后重新评估窗口确认条件，确实变为
+            # 已确认的窗口发布独立新修订；只记录设置而不重新判断是
+            # 错误的。允许迟到期限（set_lateness）是独立设置，不因
+            # 口径变化而改变，此前被丢弃的事件仍由迟到期限决定。
+            # 已确认窗口沿用发布时口径，范围外窗口完全不受影响。
+            confirmed_starts = {json.loads(k)[0] for k in self.confirmed}
+            in_range_starts = set()
+            for key in self._current_windows():
+                if start <= key[0] < end:
+                    in_range_starts.add(key[0])
+            for win_start in in_range_starts:
+                key_str = str(win_start)
+                if win_start in confirmed_starts:
+                    continue
+                snapshot = self.window_confirmation.get(
+                    key_str, self._confirmation_snapshot((win_start, ())))
+                if snapshot["policy"] != policy:
+                    self.window_confirmation[key_str] = \
+                        self._snapshot_with_policy(snapshot, win_start, policy)
+            windows = self._current_windows()
+            newly_confirmed = []
+            for key in windows:
+                if not (start <= key[0] < end):
+                    continue
+                if key[0] in confirmed_starts:
+                    continue
+                if self._is_confirmed(key):
+                    newly_confirmed.append(key)
+            revision = None
+            if newly_confirmed:
+                self._pending_causes.append({
+                    "type": "confirmation_policy",
+                    "rule_change": change["id"],
+                    "confirmation_policy": policy,
+                    "window_range": [fmt_ts(start), fmt_ts(end)]})
+                revision = self._publish_revision()
+            impact["newly_confirmed"] = sorted(
+                _window_label(k, self.size, self.group_by)["window_start"]
+                for k in newly_confirmed)
+            impact["revision"] = revision
             impact["preserved_published_windows"] = preserved
             impact["acknowledged"] = True
         else:

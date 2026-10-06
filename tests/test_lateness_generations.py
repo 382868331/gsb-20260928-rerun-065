@@ -289,6 +289,113 @@ class TestConfirmationPolicy(unittest.TestCase):
                          ["confirmation_policy"], "on_watermark")
         self.assertEqual(open(rev1, "rb").read(), rev1_bytes)
 
+    def _after_lateness_engine_with_two_waiting_windows(self, name):
+        """after_lateness 口径下 W0/W1 都在等迟到期限，且有一条被丢弃事件。"""
+        spec = make_spec()
+        spec["streams"] = ["events"]
+        spec["primary_source"] = "events"
+        spec["lateness"] = {"events": 300}
+        spec["confirmation_policy"] = "after_lateness"
+        state_dir = os.path.join(self.tmp, name)
+        engine = WindowEngine(spec, state_dir)
+        engine.apply_event(ev("events", 1, "e1",
+                              "2026-01-01T00:00:10Z", "c1", 100))
+        engine.apply_event(ev("events", 2, "e3",
+                              "2026-01-01T00:01:10Z", "c1", 50))
+        # 水位到 00:06:30：W0 在 on_watermark 口径下早已确认，在
+        # after_lateness 口径下（期限 00:06）也刚到点、但 W1 期限
+        # （00:07）未到；为保证 W0 确实仍在等待，水位取 00:05:30。
+        engine.apply_event(wm("events", "2026-01-01T00:05:30Z"))
+        self.assertEqual(engine.confirmed_view(), [])
+        # 超过迟到期限的旧事件被丢弃并记录
+        dropped = engine.apply_event(ev("events", 3, "e2",
+                                        "2025-12-31T23:59:55Z",
+                                        "c1", 7))
+        self.assertEqual(dropped.get("dropped"), "too_late")
+        return engine, state_dir
+
+    def test_historical_restudy_switch_to_on_watermark_confirms_new_revision(self):
+        engine, state_dir = self.\
+            _after_lateness_engine_with_two_waiting_windows("switch")
+        # 只选 W0 做历史重研；无显式确认必须拒绝
+        with self.assertRaisesRegex(ValueError, "confirm=True"):
+            engine.set_confirmation_policy(
+                "on_watermark", scope="revision",
+                window_range=(W0, W1))
+        self.assertEqual(engine.confirmed_view(), [])
+        impact = engine.set_confirmation_policy(
+            "on_watermark", scope="revision",
+            window_range=(W0, W1), confirm=True)
+        # 显式确认后必须重新判断：W0 水位早已到达，立即发布为独立修订
+        self.assertEqual(impact["revision"], 1)
+        self.assertEqual(impact["newly_confirmed"], [W0])
+        rows = view_map(engine.confirmed_view())
+        self.assertIn((W0, "c1"), rows)
+        self.assertEqual(rows[(W0, "c1")]["confirmation_policy"],
+                         "on_watermark")
+        self.assertEqual(rows[(W0, "c1")]["total"], 100)
+        causes = engine.revision_causes()[1]
+        self.assertEqual([c["type"] for c in causes],
+                         ["confirmation_policy"])
+        rev_path = os.path.join(state_dir, "revisions", "rev-00001.jsonl")
+        rev_rows = [json.loads(line) for line in open(rev_path)
+                    if line.strip()]
+        self.assertEqual(len(rev_rows), 1)
+        self.assertEqual(rev_rows[0]["confirmation_policy"], "on_watermark")
+
+    def test_historical_restudy_isolates_range_and_survives_reopen(self):
+        engine, state_dir = self.\
+            _after_lateness_engine_with_two_waiting_windows("isolate")
+        # 已有 W0 之外的窗口（W1）等待同一水位：范围必须隔离
+        impact = engine.set_confirmation_policy(
+            "on_watermark", scope="revision",
+            window_range=(W0, W1), confirm=True)
+        self.assertEqual(impact["revision"], 1)
+        tentative = view_map(engine.tentative_view())
+        self.assertEqual(tentative[(W1, "c1")]["status"], "tentative")
+        self.assertEqual(tentative[(W1, "c1")]["confirmation_policy"],
+                         "after_lateness")
+        self.assertEqual(tentative[(W1, "c1")]["waiting_on"], ["events"])
+        # 保存重开：确认结果、口径快照与修订依据都保留
+        reopen_spec = make_spec()
+        reopen_spec["streams"] = ["events"]
+        reopen_spec["primary_source"] = "events"
+        reopen_spec["lateness"] = {"events": 300}
+        reopen_spec["confirmation_policy"] = "after_lateness"
+        reopened = WindowEngine(reopen_spec, state_dir)
+        self.assertEqual(reopened.revision, 1)
+        rows = view_map(reopened.confirmed_view())
+        self.assertEqual(rows[(W0, "c1")]["confirmation_policy"],
+                         "on_watermark")
+        reopened_tentative = view_map(reopened.tentative_view())
+        self.assertEqual(reopened_tentative[(W1, "c1")]
+                         ["confirmation_policy"], "after_lateness")
+        # 水位越过 W1 的迟到期限后，W1 仍按原 after_lateness 口径确认
+        reopened.apply_event(wm("events", "2026-01-01T00:07:00Z"))
+        rows = view_map(reopened.confirmed_view())
+        self.assertEqual(rows[(W1, "c1")]["confirmation_policy"],
+                         "after_lateness")
+        self.assertEqual(os.path.exists(os.path.join(
+            state_dir, "revisions", "rev-00002.jsonl")), True)
+
+    def test_historical_restudy_no_change_publishes_no_revision(self):
+        spec = make_spec()
+        spec["streams"] = ["events"]
+        spec["primary_source"] = "events"
+        spec["lateness"] = {"events": 60}
+        spec["confirmation_policy"] = "after_lateness"
+        engine = WindowEngine(spec, os.path.join(self.tmp, "nochange"))
+        engine.apply_event(ev("events", 1, "e1",
+                              "2026-01-01T00:00:10Z", "c1", 100))
+        engine.apply_event(wm("events", "2026-01-01T00:00:30Z"))
+        impact = engine.set_confirmation_policy(
+            "on_watermark", scope="revision",
+            window_range=(W0, W1), confirm=True)
+        # 水位连 W0 结束都没到：改了口径也无可确认窗口，不制造修订
+        self.assertIsNone(impact["revision"])
+        self.assertEqual(impact["newly_confirmed"], [])
+        self.assertEqual(engine.confirmed_view(), [])
+
 
 class TestSourceGenerations(unittest.TestCase):
     def setUp(self):
